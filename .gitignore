@@ -1,6 +1,6 @@
 venv/
 .env
-.env.sops
 __pycache__/
 *.pyc
 .DS_Store
+.gitignore

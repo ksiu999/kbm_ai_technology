@@ -1,0 +1,11 @@
+creation_rules:
+  # Шифрование .env.sops файла
+  # Для использования укажите ваш публичный ключ Age в параметре ниже
+  # Получить публичный ключ можно командой: cat ~/.config/sops/age/keys.txt | grep "age"
+  # Или: sops generate age (для создания новой пары ключей)
+  - path_regex: '\.env\.sops$'
+    encrypted_regex: '^(data|stringData|SCHOOL_API_KEY)$'
+    # Укажите ваш публичный ключ Age здесь:
+    # age: <public_key_here>
+    # Пример: age1ql3z7hjy5pyzxfrk6rctvcq05wdfgqpfj8c6e29js2gp6fdywqtspat9qm
+    age: ""

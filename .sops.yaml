@@ -1,4 +1,3 @@
 creation_rules:
-  - path_regex: '\.env$'
-    encrypted_regex: "^(data|stringData|SCHOOL_API_KEY)$"
+  - path_regex: '\.env\.sops$'
     age: "age1e306uw9fgq8mxmxuvxakyj7dzxpstmwh8v3xs6mht588exfkxqpsnrrp8m"

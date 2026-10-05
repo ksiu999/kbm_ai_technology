@@ -3,3 +3,13 @@ openai
 numpy
 pandas
 python-dotenv
+streamlit
+openai
+numpy
+pandas
+python-dotenv
+rank-bm25
+nltk
+pymorphy3
+scikit-learn
+requests

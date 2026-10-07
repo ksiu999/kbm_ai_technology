@@ -1,12 +1,10 @@
-import json
 import os
-import re
-import time
+import subprocess
+import io
 import streamlit as st
-import pandas as pd
-import numpy as np
 import requests
 from dotenv import load_dotenv
+from rag_engine import HybridSearchEngine
 from config import (
     ROUTER_BASE_URL,
     ROUTER_MODEL,
@@ -14,209 +12,170 @@ from config import (
     SCHOOL_EMBEDDING_MODEL,
 )
 
-load_dotenv()
 
-
-# --- Косинусное сходство ---
-def cosine_similarity(vec1, vec2):
-    return float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
-
-
-# --- Конфигурация API ---
-EMBED_URL = f"{SCHOOL_BASE_URL}/embeddings"
-CHAT_URL = f"{ROUTER_BASE_URL}/chat/completions"
-
-
-# --- Функция получения эмбеддинга (Школьный API) ---
-def get_query_embedding(text, max_retries=3):
-    """Генерирует эмбеддинг пользовательского запроса через HTTP-запрос."""
-    api_key = os.getenv("SCHOOL_API_KEY")
-    if not api_key:
-        raise Exception("SCHOOL_API_KEY не найден в .env")
-
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-    for attempt in range(max_retries):
+# --- Загрузка секретов из .env.sops с надежным фоллбэком ---
+def load_sops_env(file_path: str = ".env.sops"):
+    """Расшифровывает .env.sops и загружает переменные в окружение."""
+    sops_success = False
+    if os.path.exists(file_path):
         try:
-            resp = requests.post(
-                EMBED_URL,
-                json={"model": SCHOOL_EMBEDDING_MODEL, "input": text},
-                headers=headers,
+            result = subprocess.run(
+                ["sops", "-d", file_path], capture_output=True, text=True, check=True
             )
-            if resp.status_code == 200:
-                return resp.json()["data"][0]["embedding"]
-            if resp.status_code >= 500:
-                time.sleep((attempt + 1) * 2)
-                continue
-            raise Exception(f"Embedding Error {resp.status_code}: {resp.text[:200]}")
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise e
-            time.sleep((attempt + 1) * 2)
+            load_dotenv(stream=io.StringIO(result.stdout))
+            print("✅ Секреты успешно загружены из .env.sops")
+            sops_success = True
+        except subprocess.CalledProcessError as e:
+            print(f"⚠️ Ошибка расшифровки .env.sops: {e.stderr.strip()}")
+        except FileNotFoundError:
+            print("⚠️ Утилита 'sops' не найдена в PATH.")
+
+    # Если SOPS не сработал или файла нет, грузим обычный .env
+    if not sops_success:
+        load_dotenv()
+        print("ℹ️ Загружены переменные из стандартного файла .env")
+
+    # Мгновенная проверка, что ключи действительно загрузились
+    if not os.getenv("SCHOOL_API_KEY"):
+        print(
+            "❌ КРИТИЧЕСКАЯ ОШИБКА: SCHOOL_API_KEY пустой! Проверьте содержимое файла .env"
+        )
+    else:
+        print("✅ SCHOOL_API_KEY успешно загружен и готов к работе.")
+
+    if not os.getenv("ROUTER_API_KEY"):
+        print(
+            "❌ КРИТИЧЕСКАЯ ОШИБКА: ROUTER_API_KEY пустой! Проверьте содержимое файла .env"
+        )
+    else:
+        print("✅ ROUTER_API_KEY успешно загружен и готов к работе.")
 
 
-# --- Проверка API ключей ---
+# Вызов функции ДО любого использования os.getenv()
+load_sops_env()
+
+# --- Константы (приоритет: .env.sops -> config.py) ---
+DILAB_DB_PATH = "db/dilab_chunks.jsonl"
+
+# URL для чата (по умолчанию из config.py, но можно переопределить в .env.sops)
+CHAT_BASE_URL = os.getenv("ROUTER_BASE_URL", ROUTER_BASE_URL)
+CHAT_URL = f"{CHAT_BASE_URL}/chat/completions"
+
+# Модель для чата (по умолчанию из config.py)
+CHAT_MODEL = os.getenv("ROUTER_MODEL", ROUTER_MODEL)
+
+# URL для эмбеддингов (по умолчанию из config.py)
+EMBED_URL = os.getenv("EMBED_URL", f"{SCHOOL_BASE_URL}/embeddings")
+
+# --- Проверка API ключей для UI ---
 school_key = os.getenv("SCHOOL_API_KEY")
 router_key = os.getenv("ROUTER_API_KEY")
 
 if not school_key:
-    st.error("❌ SCHOOL_API_KEY не найден в .env")
+    st.error("❌ SCHOOL_API_KEY не найден в окружении")
 else:
-    st.sidebar.success("\u2705 School API Key loaded")
+    st.sidebar.success("✅ SCHOOL_API_KEY загружен")
 
 if not router_key:
-    st.error("❌ ROUTER_API_KEY не найден в .env")
+    st.error("❌ ROUTER_API_KEY не найден в окружении")
 else:
-    st.sidebar.success("\u2705 RouterAI Key loaded")
+    st.sidebar.success("✅ ROUTER_API_KEY загружен")
 
-st.caption(
-    f"🟢 Chat: {ROUTER_MODEL} via RouterAI | 🔵 Embeddings: {SCHOOL_EMBEDDING_MODEL} via School API"
-)
 
-# --- Загрузка базы знаний ---
-DB_PATH = "db/chunks.jsonl"
-st.title("\U0001f3ed Агент расчета оборудования КБМ")
+# --- Инициализация движка с кэшированием ---
+@st.cache_resource(show_spinner="Загрузка индекса и инициализация BM25...")
+def init_engine():
+    return HybridSearchEngine(
+        db_path=DILAB_DB_PATH, embed_url=EMBED_URL, api_key=school_key, alpha=0.5
+    )
 
-if os.path.exists(DB_PATH):
-    with open(DB_PATH, "r", encoding="utf-8") as f:
-        st.session_state.chunks = [json.loads(line) for line in f if line.strip()]
-    st.sidebar.success(f"\U0001f4da База знаний: {len(st.session_state.chunks)} чанков")
-else:
+
+st.title("🏭 ДиЛаб — Агент по должностным инструкциям")
+
+try:
+    engine = init_engine()
+    has_index = len(engine.chunks) > 0
+    st.sidebar.success(f"📚 База знаний ДиЛаб: {len(engine.chunks)} чанков")
+except FileNotFoundError:
+    has_index = False
     st.warning(
-        f"База данных не найдена: {DB_PATH}. Запустите `python3 preprocess_kb.py`"
+        f"Индекс не найден: {DILAB_DB_PATH}. Запустите `python ingest.py` для создания базы."
     )
-    st.session_state.chunks = []
+    engine = None
 
-# Чат
-if len(st.session_state.chunks) == 0:
-    prompt = st.chat_input("Задайте вопрос технологу...", disabled=True)
-else:
-    prompt = st.chat_input("Задайте вопрос технологу...")
+prompt = st.chat_input("Задайте вопрос по инструкциям...", disabled=not has_index)
 
-if prompt:
-    # ===== ШАГ 1: Поиск похожих чанков =====
-    with st.spinner("Ищем данные в базе..."):
-        try:
-            query_emb = get_query_embedding(prompt)
-        except Exception as e:
-            st.error(f"Ошибка векторизации: {e}")
-            st.stop()
+if prompt and has_index and engine:
+    with st.chat_message("user"):
+        st.write(prompt)
 
-    ranked = []
-    for chunk in st.session_state.chunks:
-        sim = cosine_similarity(query_emb, chunk["embedding"])
-        ranked.append((chunk, float(sim)))
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    top_chunks = ranked[:5]
+    with st.chat_message("assistant"):
+        with st.spinner("🔍 Выполняю гибридный поиск и генерирую ответ..."):
+            # 1. Поиск
+            search_result = engine.search(prompt, top_k=5)
 
-    # ===== ШАГ 2: Подготовка контекста =====
-    context_parts = []
-    for i, (chunk, sim) in enumerate(top_chunks):
-        context_parts.append(
-            f"[Источник: {chunk['source']}]\n"
-            f"Чанк #{i + 1} (схожесть: {sim:.4f}):\n{chunk['text']}"
-        )
-    context = "\n---\n".join(context_parts)
+            # 2. UI: Логика работы RAG
+            with st.expander("🔍 Логика работы RAG (Hybrid Search)", expanded=False):
+                st.write(
+                    f"**Извлеченные ключевые слова:** `{', '.join(search_result['keywords'])}`"
+                )
 
-    system_prompt = (
-        "Ты инженер-технолог КБМ. Отвечай кратко и по существу, опираясь ТОЛЬКО на предоставленный КОНТЕКСТ. "
-        "Если информации нет, так и скажи. "
-        "Ответ СТРОГО в формате JSON: "
-        "{ 'summary': 'текстовый ответ', 'equipment_table': [{'name': 'название', 'qty': число, 'spec': 'характеристика'}] }."
-    )
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Топ-5 Embedding:**")
+                    for item in search_result["top_embedding"][:5]:
+                        st.caption(
+                            f"Скор: {item['embed_score']:.4f} | {item['source']}"
+                        )
+                with col2:
+                    st.markdown("**Топ чанков по ключевым словам (BM25):**")
+                    for item in search_result["top_bm25"]:
+                        st.caption(f"Скор: {item['bm25_score']:.4f} | {item['source']}")
 
-    # ===== ШАГ 3: Генерация ответа через RouterAI =====
-    col_chat, col_result, col_sources = st.columns([1, 1.5, 1])
+                st.markdown("**Финальный ранжированный список (передается в LLM):**")
+                for item in search_result["final_results"]:
+                    st.markdown(
+                        f"- **{item['source']}** (Итоговый скор: {item['final_score']:.4f})\n  > {item['text'][:150]}..."
+                    )
 
-    with col_chat:
-        with st.chat_message("user"):
-            st.write(prompt)
+            # 3. Формирование контекста и запрос к LLM
+            context = "\n\n".join(
+                [
+                    f"Источник: {c['source']}\nТекст: {c['text']}"
+                    for c in search_result["final_results"]
+                ]
+            )
 
-        with st.chat_message("assistant"):
-            msg_placeholder = st.empty()
-
+            system_prompt = "Ты полезный ассистент. Отвечай строго на основе предоставленного контекста. Если ответа нет в контексте, скажи об этом."
             messages = [
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
-                    "content": f"Контекст:\n{context}\n\nВопрос: {prompt}",
+                    "content": f"Контекст:\n{context}\n\nВопрос пользователя: {prompt}",
                 },
             ]
-
-            payload = {"model": ROUTER_MODEL, "messages": messages, "temperature": 0.0}
 
             headers = {
                 "Authorization": f"Bearer {router_key}",
                 "Content-Type": "application/json",
             }
 
+            # УЛУЧШЕННАЯ ОТЛАДКА: покажем длину ключа, чтобы исключить его обрезку при расшифровке SOPS
+            key_len = len(router_key) if router_key else 0
+            key_start = router_key[:10] if key_len > 10 else router_key
+            print(f"🔍 DEBUG: Запрос на {CHAT_URL}")
+            print(f"🔍 DEBUG: Модель: {CHAT_MODEL}")
+            print(f"🔍 DEBUG: Ключ (длина={key_len}): {key_start}...")
+
+            payload = {"model": CHAT_MODEL, "messages": messages}
+
             try:
-                with st.spinner(f"Генерация ответа ({ROUTER_MODEL})..."):
-                    r = requests.post(
-                        CHAT_URL, json=payload, headers=headers, timeout=60
-                    )
-
-                if r.status_code != 200:
-                    st.error(f"Ошибка RouterAI: HTTP {r.status_code}")
-                    st.code(r.text[:500])
-                    st.stop()
-
-                raw_answer = r.json()["choices"][0]["message"]["content"]
-
-                # Парсинг JSON
-                summary_text = raw_answer
-                equipment_data = []
-
-                try:
-                    json_block = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_answer)
-                    if json_block:
-                        parsed = json.loads(json_block.group(1))
-                    else:
-                        parsed = json.loads(raw_answer)
-
-                    if isinstance(parsed, dict) and "equipment_table" in parsed:
-                        summary_text = parsed.get("summary", "")
-                        equipment_data = parsed.get("equipment_table", [])
-                    elif isinstance(parsed, list):
-                        equipment_data = parsed
-
-                except json.JSONDecodeError:
-                    st.warning("⚠️ Модель вернула не JSON, вывожу сырой текст.")
-
-                msg_placeholder.markdown(summary_text if summary_text else raw_answer)
-
+                response = requests.post(CHAT_URL, json=payload, headers=headers)
+                response.raise_for_status()
+                ai_answer = response.json()["choices"][0]["message"]["content"]
+                st.write(ai_answer)
             except Exception as e:
-                st.error(f"Ошибка соединения с RouterAI: {e}")
+                st.error(f"Ошибка при запросе к RouterAI: {e}")
 
-    # — Колонка 2: Таблица результата —
-    with col_result:
-        st.subheader("📊 Результат расчета")
-        if equipment_data:
-            table_rows = []
-            for item in equipment_data:
-                if isinstance(item, dict):
-                    table_rows.append(
-                        {
-                            "Название": str(item.get("name", "")),
-                            "Кол-во": str(item.get("qty", "")),
-                            "Характеристика": str(item.get("spec", "")),
-                        }
-                    )
-            if table_rows:
-                df_equipment = pd.DataFrame(table_rows)
-                st.dataframe(df_equipment, use_container_width=True, hide_index=True)
-            else:
-                st.info("Нет данных об оборудовании.")
-        else:
-            st.info("Структурированные данные не получены.")
-
-    # — Колонка 3: Источники —
-    with col_sources:
-        st.subheader("📚 Источники RAG")
-        with st.expander("Показать 5 найденных фрагментов"):
-            for i, (chunk, sim) in enumerate(top_chunks):
-                st.caption(f"#{i + 1} · схожесть: {sim:.4f}")
-                truncated = chunk["text"][:400]
-                if len(chunk["text"]) > 400:
-                    truncated += "..."
-                st.text_area("", value=truncated, height=200, disabled=True)
+elif not has_index and prompt:
+    st.error("База данных пуста. Сначала запустите индексацию.")
